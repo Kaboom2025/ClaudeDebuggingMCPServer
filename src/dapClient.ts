@@ -234,18 +234,19 @@ export class DAPClient extends EventEmitter {
   }
 
   async attach(): Promise<any> {
+    // debugpy attach request format for local debugging
     return this.sendRequest('attach', {
-      connect: {
-        host: 'localhost',
-        port: this.port
-      }
+      pathMappings: [{
+        localRoot: process.cwd(),
+        remoteRoot: process.cwd()
+      }],
+      justMyCode: false
     });
   }
 
   async setBreakpoints(source: string, lines: number[]): Promise<any> {
     return this.sendRequest('setBreakpoints', {
       source: { path: source },
-      lines,
       breakpoints: lines.map(line => ({ line }))
     });
   }

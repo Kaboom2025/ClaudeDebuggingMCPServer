@@ -319,10 +319,46 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           // Set up DAP event handlers
           setupDAPEventHandlers(session);
 
-          // Initialize debugger
-          await dapClient.initialize();
-          await dapClient.attach();
-          await dapClient.configurationDone();
+          // Initialize debugger with detailed logging
+          logger.system(session.id, 'Starting DAP initialization sequence...');
+          
+          try {
+            logger.system(session.id, 'Sending initialize request...');
+            const initResult = await dapClient.initialize();
+            logger.system(session.id, 'Initialize request successful', { initResult });
+            
+            logger.system(session.id, 'Sending attach request...');
+            // For debugpy, we need to wait for the 'initialized' event instead of attach response
+            const attachPromise = new Promise<void>((resolve, reject) => {
+              const timeout = setTimeout(() => {
+                reject(new Error('Timeout waiting for initialized event'));
+              }, 10000);
+              
+              dapClient.once('initialized', () => {
+                clearTimeout(timeout);
+                logger.system(session.id, 'Received initialized event');
+                resolve();
+              });
+            });
+            
+            // Send attach request (might not get direct response)
+            dapClient.attach().catch(() => {}); // Ignore attach response errors
+            
+            // Wait for initialized event
+            await attachPromise;
+            logger.system(session.id, 'Attach sequence successful');
+            
+            logger.system(session.id, 'Sending configurationDone request...');
+            const configResult = await dapClient.configurationDone();
+            logger.system(session.id, 'ConfigurationDone request successful', { configResult });
+            
+          } catch (dapError) {
+            logger.systemError(session.id, `DAP initialization failed: ${dapError}`, { 
+              error: dapError?.toString(),
+              step: 'DAP_PROTOCOL_INIT'
+            });
+            throw new Error(`DAP protocol initialization failed: ${dapError}`);
+          }
 
           sessionManager.updateSessionState(session.id, 'running');
           
@@ -419,59 +455,84 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           throw new McpError(ErrorCode.InvalidParams, 'Line number must be >= 1');
         }
 
-        // Get existing breakpoints for the file
-        const existingBreakpoints = sessionManager.getBreakpoints(session_id, file);
-        const existingLines = existingBreakpoints.map(bp => bp.line);
+        try {
+          // Get existing breakpoints for the file
+          const existingBreakpoints = sessionManager.getBreakpoints(session_id, file);
+          const existingLines = existingBreakpoints.map(bp => bp.line);
 
-        // Add new breakpoint if not already present
-        if (!existingLines.includes(line)) {
-          existingLines.push(line);
+          // Add new breakpoint if not already present
+          if (!existingLines.includes(line)) {
+            existingLines.push(line);
+          }
+
+          logger.breakpoint(session_id, `Setting breakpoints at ${file}`, {
+            file,
+            requestedLines: existingLines,
+            newLine: line
+          });
+
+          // Set breakpoints via DAP
+          const response = await session.dapClient.setBreakpoints(resolve(file), existingLines);
+          
+          if (!response || !response.breakpoints) {
+            throw new Error('Invalid response from debugpy setBreakpoints');
+          }
+        
+          // Update session breakpoints
+          const breakpoints = response.breakpoints.map((bp: any, index: number) => ({
+            id: bp.id || index,
+            file,
+            line: existingLines[index],
+            verified: bp.verified,
+          }));
+
+          sessionManager.setBreakpoints(session_id, file, breakpoints);
+          
+          // Enhanced logging for breakpoint set
+          const targetBreakpoint = response.breakpoints[existingLines.indexOf(line)];
+          const verified = targetBreakpoint?.verified;
+          
+          logger.breakpoint(session_id, `Breakpoint set at ${file}:${line}`, {
+            file,
+            line,
+            verified,
+            id: targetBreakpoint?.id,
+            action: 'set'
+          });
+          
+          // Update event broadcaster with new breakpoints
+          eventBroadcaster.updateSessionState(session_id, {
+            breakpoints: breakpoints.map((bp: any) => ({
+              id: bp.id,
+              file: bp.file,
+              line: bp.line,
+              verified: bp.verified
+            }))
+          });
+
+          return {
+            content: [
+              {
+                type: 'text',
+                text: `📍 Breakpoint set at ${file}:${line}\n` +
+                      `Status: ${verified ? '✅ Verified' : '⚠️ Unverified'}`,
+              },
+            ],
+          };
+          
+        } catch (error) {
+          logger.systemError(session_id, `Failed to set breakpoint: ${error}`, {
+            file,
+            line,
+            error: error?.toString(),
+            sessionState: session.state
+          });
+          
+          throw new McpError(
+            ErrorCode.InternalError, 
+            `Failed to set breakpoint at ${file}:${line}: ${error}`
+          );
         }
-
-        // Set breakpoints via DAP
-        const response = await session.dapClient.setBreakpoints(resolve(file), existingLines);
-        
-        // Update session breakpoints
-        const breakpoints = response.breakpoints.map((bp: any, index: number) => ({
-          id: bp.id || index,
-          file,
-          line: existingLines[index],
-          verified: bp.verified,
-        }));
-
-        sessionManager.setBreakpoints(session_id, file, breakpoints);
-        
-        // Enhanced logging for breakpoint set
-        const targetBreakpoint = response.breakpoints[existingLines.indexOf(line)];
-        const verified = targetBreakpoint?.verified;
-        
-        logger.breakpoint(session_id, `Breakpoint set at ${file}:${line}`, {
-          file,
-          line,
-          verified,
-          id: targetBreakpoint?.id,
-          action: 'set'
-        });
-        
-        // Update event broadcaster with new breakpoints
-        eventBroadcaster.updateSessionState(session_id, {
-          breakpoints: breakpoints.map((bp: any) => ({
-            id: bp.id,
-            file: bp.file,
-            line: bp.line,
-            verified: bp.verified
-          }))
-        });
-
-        return {
-          content: [
-            {
-              type: 'text',
-              text: `📍 Breakpoint set at ${file}:${line}\n` +
-                    `Status: ${verified ? '✅ Verified' : '⚠️ Unverified'}`,
-            },
-          ],
-        };
       }
 
       case 'remove_breakpoint': {
@@ -953,6 +1014,23 @@ function setupDAPEventHandlers(session: any) {
     }
   });
 }
+
+// Global error handlers to prevent server crashes
+process.on('uncaughtException', (error) => {
+  logger.systemError('server', `Uncaught exception: ${error.message}`, { 
+    error: error.toString(),
+    stack: error.stack
+  });
+  // Don't exit - try to keep server running
+});
+
+process.on('unhandledRejection', (reason, promise) => {
+  logger.systemError('server', `Unhandled rejection: ${reason}`, { 
+    reason: reason?.toString(),
+    promise: promise.toString()
+  });
+  // Don't exit - try to keep server running
+});
 
 // Graceful shutdown
 process.on('SIGINT', async () => {
