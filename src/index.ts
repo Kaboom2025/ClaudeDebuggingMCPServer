@@ -10,6 +10,7 @@ import {
 } from '@modelcontextprotocol/sdk/types.js';
 import { SessionManager } from './sessionManager.js';
 import { ProcessManager } from './processManager.js';
+import { DAPClient } from './dapClient.js';
 import { logger } from './logger.js';
 import { eventBroadcaster } from './eventBroadcaster.js';
 import { resolve } from 'path';
@@ -54,6 +55,25 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
             cwd: {
               type: 'string',
               description: 'Working directory for the script (optional)',
+            },
+          },
+          required: ['script_path'],
+        },
+      },
+      {
+        name: 'attach_to_debugpy',
+        description: 'Attach to an existing debugpy session running in your terminal',
+        inputSchema: {
+          type: 'object',
+          properties: {
+            port: {
+              type: 'number',
+              description: 'Port where debugpy is listening (default: 5678)',
+              default: 5678,
+            },
+            script_path: {
+              type: 'string',
+              description: 'Path to the Python script being debugged',
             },
           },
           required: ['script_path'],
@@ -319,38 +339,33 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           // Set up DAP event handlers
           setupDAPEventHandlers(session);
 
-          // Initialize debugger with detailed logging
+          // Initialize debugger with enhanced robustness
           logger.system(session.id, 'Starting DAP initialization sequence...');
           
           try {
+            // Step 1: Initialize with retry logic
             logger.system(session.id, 'Sending initialize request...');
-            const initResult = await dapClient.initialize();
+            const initResult = await retryDAPOperation(() => dapClient.initialize(), 'initialize', 3, session.id);
             logger.system(session.id, 'Initialize request successful', { initResult });
             
-            logger.system(session.id, 'Sending attach request...');
-            // For debugpy, we need to wait for the 'initialized' event instead of attach response
-            const attachPromise = new Promise<void>((resolve, reject) => {
-              const timeout = setTimeout(() => {
-                reject(new Error('Timeout waiting for initialized event'));
-              }, 10000);
-              
-              dapClient.once('initialized', () => {
-                clearTimeout(timeout);
-                logger.system(session.id, 'Received initialized event');
-                resolve();
-              });
-            });
-            
-            // Send attach request (might not get direct response)
-            dapClient.attach().catch(() => {}); // Ignore attach response errors
-            
-            // Wait for initialized event
-            await attachPromise;
+            // Step 2: Attach with proper event handling
+            logger.system(session.id, 'Starting attach sequence...');
+            const attachSuccess = await performAttachSequence(dapClient, session.id);
+            if (!attachSuccess) {
+              throw new Error('Attach sequence failed after retries');
+            }
             logger.system(session.id, 'Attach sequence successful');
             
+            // Step 3: Validate connection before configurationDone
+            await validateDAPConnection(dapClient, session.id);
+            
+            // Step 4: Configuration done with validation
             logger.system(session.id, 'Sending configurationDone request...');
-            const configResult = await dapClient.configurationDone();
+            const configResult = await retryDAPOperation(() => dapClient.configurationDone(), 'configurationDone', 2, session.id);
             logger.system(session.id, 'ConfigurationDone request successful', { configResult });
+            
+            // Step 5: Get initial thread information
+            await initializeThreadContext(session, dapClient);
             
           } catch (dapError) {
             logger.systemError(session.id, `DAP initialization failed: ${dapError}`, { 
@@ -385,6 +400,111 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           // Clean up on failure
           await sessionManager.terminateSession(session.id);
           throw new McpError(ErrorCode.InternalError, `Failed to start debug session: ${error}`);
+        }
+      }
+
+      case 'attach_to_debugpy': {
+        const { port = 5678, script_path } = args as {
+          port?: number;
+          script_path: string;
+        };
+
+        // Validate script path
+        const validation = ProcessManager.validateScriptPath(script_path);
+        if (!validation.isValid) {
+          throw new McpError(ErrorCode.InvalidParams, validation.error!);
+        }
+
+        // Create session for attachment
+        const session = sessionManager.createSession(resolve(script_path));
+        // Override port for attachment
+        session.port = port;
+
+        try {
+          // Initialize session state in event broadcaster
+          eventBroadcaster.updateSessionState(session.id, {
+            sessionId: session.id,
+            scriptPath: session.scriptPath,
+            state: 'starting',
+            port: session.port,
+            startTime: session.startTime,
+            breakpoints: []
+          });
+
+          // Create DAP client for existing debugpy session
+          const dapClient = new DAPClient(port, session.id);
+          session.dapClient = dapClient;
+          session.pythonProcess = null; // No process to manage - user controls it
+
+          // Set up DAP event handlers
+          setupDAPEventHandlers(session);
+
+          // Connect to existing debugpy session
+          logger.system(session.id, `Attaching to existing debugpy session on port ${port}...`);
+          
+          try {
+            // Step 1: Connect to the existing debugpy server
+            await dapClient.connect(5000);
+            logger.system(session.id, `Connected to debugpy server on port ${port}`);
+            
+            // Step 2: Initialize with retry logic
+            logger.system(session.id, 'Starting DAP initialization sequence...');
+            const initResult = await retryDAPOperation(() => dapClient.initialize(), 'initialize', 3, session.id);
+            logger.system(session.id, 'Initialize request successful', { initResult });
+            
+            // Step 3: Attach with proper event handling
+            logger.system(session.id, 'Starting attach sequence...');
+            const attachSuccess = await performAttachSequence(dapClient, session.id);
+            if (!attachSuccess) {
+              throw new Error('Attach sequence failed after retries');
+            }
+            logger.system(session.id, 'Attach sequence successful');
+            
+            // Step 4: Validate connection
+            await validateDAPConnection(dapClient, session.id);
+            
+            // Step 5: Configuration done
+            logger.system(session.id, 'Sending configurationDone request...');
+            const configResult = await retryDAPOperation(() => dapClient.configurationDone(), 'configurationDone', 2, session.id);
+            logger.system(session.id, 'ConfigurationDone request successful', { configResult });
+            
+            // Step 6: Initialize thread context
+            await initializeThreadContext(session, dapClient);
+            
+          } catch (dapError) {
+            logger.systemError(session.id, `DAP attachment failed: ${dapError}`, { 
+              error: dapError?.toString(),
+              port,
+              step: 'DAP_ATTACH'
+            });
+            throw new Error(`DAP attachment failed: ${dapError}`);
+          }
+
+          sessionManager.updateSessionState(session.id, 'running');
+          
+          // Update event broadcaster state
+          eventBroadcaster.updateSessionState(session.id, {
+            state: 'running'
+          });
+
+          return {
+            content: [
+              {
+                type: 'text',
+                text: `✅ Successfully attached to debugpy session!\n\n` +
+                      `Session ID: ${session.id}\n` +
+                      `Script: ${session.scriptPath}\n` +
+                      `Port: ${session.port}\n` +
+                      `State: ${session.state}\n\n` +
+                      `🐛 Attached to your running Python process. ` +
+                      `You can now set breakpoints and control execution.`,
+              },
+            ],
+          };
+        } catch (error) {
+          // Clean up on failure
+          await sessionManager.terminateSession(session.id);
+          throw new McpError(ErrorCode.InternalError, `Failed to attach to debugpy session: ${error}`);
         }
       }
 
@@ -453,6 +573,14 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
 
         if (line < 1) {
           throw new McpError(ErrorCode.InvalidParams, 'Line number must be >= 1');
+        }
+
+        // Validate DAP connection before attempting breakpoint operations
+        try {
+          await validateDAPConnection(session.dapClient, session_id);
+        } catch (connectionError) {
+          throw new McpError(ErrorCode.InternalError, 
+            `DAP connection validation failed: ${connectionError}`);
         }
 
         try {
@@ -914,21 +1042,34 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
 function setupDAPEventHandlers(session: any) {
   if (!session.dapClient) return;
 
-  session.dapClient.on('stopped', (body: any) => {
-    session.currentThreadId = body.threadId;
-    sessionManager.updateSessionState(session.id, 'paused');
-    
-    // Enhanced logging for execution pause
-    logger.executionPaused(session.id, 'EXECUTION PAUSED', {
-      reason: body.reason,
-      threadId: body.threadId,
-      hitBreakpointIds: body.hitBreakpointIds
-    });
-    
-    // Get current frame for variable inspection
-    if (body.threadId) {
-      session.dapClient.stackTrace(body.threadId).then((frames: any[]) => {
-        if (frames.length > 0) {
+  session.dapClient.on('stopped', async (body: any) => {
+    try {
+      // Validate and set thread context
+      if (!body.threadId) {
+        logger.systemError(session.id, 'Stopped event received without threadId', { body });
+        return;
+      }
+
+      session.currentThreadId = body.threadId;
+      sessionManager.updateSessionState(session.id, 'paused');
+      
+      // Enhanced logging for execution pause
+      logger.executionPaused(session.id, 'EXECUTION PAUSED', {
+        reason: body.reason,
+        threadId: body.threadId,
+        hitBreakpointIds: body.hitBreakpointIds
+      });
+      
+      // Get current frame for variable inspection with retry logic
+      try {
+        const frames = await retryDAPOperation(
+          () => session.dapClient.stackTrace(body.threadId),
+          'stackTrace',
+          2,
+          session.id
+        );
+
+        if (frames && frames.length > 0) {
           session.currentFrameId = frames[0].id;
           const location = `${frames[0].source?.path || 'unknown'}:${frames[0].line}${frames[0].name ? ` in ${frames[0].name}()` : ''}`;
           
@@ -950,15 +1091,31 @@ function setupDAPEventHandlers(session: any) {
           });
           
           // Broadcast stack frames
-          eventBroadcaster.broadcastStackFrames(session.id, frames.map(f => ({
+          eventBroadcaster.broadcastStackFrames(session.id, frames.map((f: any) => ({
             id: f.id,
             name: f.name,
             file: f.source?.path,
             line: f.line
           })));
+
+          logger.system(session.id, `Thread context updated`, {
+            threadId: session.currentThreadId,
+            frameId: session.currentFrameId,
+            totalFrames: frames.length
+          });
+        } else {
+          logger.systemError(session.id, 'No stack frames available after stopped event');
         }
-      }).catch(() => {
-        logger.systemError(session.id, 'Failed to get stack trace after stopped event');
+      } catch (stackTraceError) {
+        logger.systemError(session.id, `Failed to get stack trace after stopped event: ${stackTraceError}`, {
+          error: stackTraceError?.toString(),
+          threadId: body.threadId
+        });
+      }
+    } catch (error) {
+      logger.systemError(session.id, `Error handling stopped event: ${error}`, {
+        error: error?.toString(),
+        body
       });
     }
   });
@@ -1044,6 +1201,131 @@ process.on('SIGTERM', async () => {
   await sessionManager.terminateAllSessions();
   process.exit(0);
 });
+
+// Enhanced DAP operation helper methods
+async function retryDAPOperation(
+  operation: () => Promise<any>, 
+  operationName: string, 
+  maxRetries: number,
+  sessionId: string
+): Promise<any> {
+  for (let attempt = 1; attempt <= maxRetries; attempt++) {
+    try {
+      return await operation();
+    } catch (error) {
+      logger.systemError(sessionId, `DAP ${operationName} attempt ${attempt}/${maxRetries} failed: ${error}`, {
+        attempt,
+        maxRetries,
+        error: error?.toString()
+      });
+      
+      if (attempt === maxRetries) {
+        throw error;
+      }
+      
+      // Wait before retry with exponential backoff
+      await new Promise(resolve => setTimeout(resolve, Math.min(1000 * Math.pow(2, attempt - 1), 5000)));
+    }
+  }
+}
+
+async function performAttachSequence(dapClient: any, sessionId: string): Promise<boolean> {
+  for (let attempt = 1; attempt <= 3; attempt++) {
+    try {
+      logger.system(sessionId, `Attach sequence attempt ${attempt}/3`);
+      
+      // Set up initialized event listener with timeout
+      const initializedPromise = new Promise<void>((resolve, reject) => {
+        const timeout = setTimeout(() => {
+          reject(new Error('Timeout waiting for initialized event'));
+        }, 15000);
+        
+        dapClient.once('initialized', () => {
+          clearTimeout(timeout);
+          logger.system(sessionId, 'Received initialized event');
+          resolve();
+        });
+      });
+      
+      // Send attach request
+      logger.system(sessionId, 'Sending attach request...');
+      try {
+        await dapClient.attach();
+      } catch (attachError) {
+        // Attach might fail but initialized event might still come
+        logger.system(sessionId, `Attach request failed, waiting for initialized event: ${attachError}`);
+      }
+      
+      // Wait for initialized event
+      await initializedPromise;
+      return true;
+      
+    } catch (error) {
+      logger.systemError(sessionId, `Attach sequence attempt ${attempt} failed: ${error}`, {
+        attempt,
+        error: error?.toString()
+      });
+      
+      if (attempt < 3) {
+        await new Promise(resolve => setTimeout(resolve, 2000));
+      }
+    }
+  }
+  return false;
+}
+
+async function validateDAPConnection(dapClient: any, sessionId: string): Promise<void> {
+  try {
+    // Try to get threads to validate connection
+    logger.system(sessionId, 'Validating DAP connection...');
+    const threads = await dapClient.threads();
+    logger.system(sessionId, `DAP connection validated, found ${threads.length} threads`, {
+      threadCount: threads.length
+    });
+  } catch (error) {
+    logger.systemError(sessionId, `DAP connection validation failed: ${error}`, {
+      error: error?.toString()
+    });
+    throw new Error(`DAP connection validation failed: ${error}`);
+  }
+}
+
+async function initializeThreadContext(session: any, dapClient: any): Promise<void> {
+  try {
+    // Get available threads
+    const threads = await dapClient.threads();
+    
+    if (threads.length > 0) {
+      // Use the main thread (usually the first one)
+      session.currentThreadId = threads[0].id;
+      logger.system(session.id, `Initialized thread context`, {
+        threadId: session.currentThreadId,
+        threadName: threads[0].name,
+        totalThreads: threads.length
+      });
+      
+      // Try to get stack frames for the current thread
+      try {
+        const stackFrames = await dapClient.stackTrace(session.currentThreadId);
+        if (stackFrames.length > 0) {
+          session.currentFrameId = stackFrames[0].id;
+          logger.system(session.id, `Initialized frame context`, {
+            frameId: session.currentFrameId,
+            frameName: stackFrames[0].name
+          });
+        }
+      } catch (frameError) {
+        // This is expected if the program hasn't hit a breakpoint yet
+        logger.system(session.id, `Frame context not available yet (program running): ${frameError}`);
+      }
+    } else {
+      logger.system(session.id, 'No threads found during initialization');
+    }
+  } catch (error) {
+    // Thread initialization is not critical for basic functionality
+    logger.system(session.id, `Thread context initialization failed: ${error}`);
+  }
+}
 
 // Start the server
 async function main() {

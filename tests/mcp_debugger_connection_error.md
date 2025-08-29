@@ -34,5 +34,35 @@ When trying to attach debugger to user-owned Flask process:
 - Error setting breakpoint: "Server[pid=36007] disconnected unexpectedly"
 - Suggests MCP debugger has issues connecting to external Python processes
 
-## Workaround Needed
-MCP debugger appears to have fundamental connection issues. May need alternative debugging approach or fix to MCP debugger implementation.
+## Solution Implemented
+Added new `attach_to_debugpy` tool and enhanced DAP initialization with:
+- Retry logic with exponential backoff
+- Better connection validation
+- Improved thread/frame management
+- Robust error handling
+
+## Usage Instructions for User-Controlled Debugging
+
+### Step 1: Start Flask app with debugpy in your terminal
+```bash
+cd /Users/saalik/Documents/Projects/debugclaudecodemain/debugclaudecode
+python3 -m debugpy --listen localhost:5678 --wait-for-client tests/app.py
+```
+
+### Step 2: Attach to the debugpy session
+Use the MCP tool:
+```
+mcp__python-debug__attach_to_debugpy with:
+- script_path: /path/to/your/script.py  
+- port: 5678 (optional, defaults to 5678)
+```
+
+### Key Points
+- Your Flask server runs on port 5001 (normal Flask port)
+- Debugpy listens on port 5678 (debug protocol port) 
+- You maintain full control of your server process
+- MCP debugger only connects to the debug protocol, doesn't manage the process
+
+## Test Results
+- Connection attempts fail if Flask server not started with debugpy
+- Need to ensure `--wait-for-client` flag is used when starting with debugpy
