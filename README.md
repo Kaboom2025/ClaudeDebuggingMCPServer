@@ -28,24 +28,40 @@ A Model Context Protocol (MCP) server that enables AI-driven Python debugging th
 
 ### Installation
 
-1. **Install Python debugpy**:
+#### Option 1: Install from npm (Recommended)
+
+1. **Install the MCP server**:
+   ```bash
+   npm install -g python-debug-mcp-server
+   ```
+
+2. **Install Python debugpy**:
    ```bash
    pip install debugpy
    ```
 
-2. **Install MCP server dependencies**:
+3. **Verify setup**:
    ```bash
-   npm install
+   python-debug-mcp-server --help
    ```
 
-3. **Build the server**:
+#### Option 2: Install from source
+
+1. **Clone and build**:
    ```bash
+   git clone <repository-url>
+   cd python-debug-mcp-server
+   npm install
    npm run build
    ```
 
-4. **Verify setup**:
+2. **Install Python debugpy**:
    ```bash
-   # Test the server can start
+   pip install debugpy
+   ```
+
+3. **Verify setup**:
+   ```bash
    node build/index.js
    ```
 
@@ -53,19 +69,12 @@ A Model Context Protocol (MCP) server that enables AI-driven Python debugging th
 
 To use this MCP server with Claude Code, you have several options:
 
-### Method 1: Using Claude MCP Add (Recommended)
+### Method 1: Using npm package (Recommended)
 
-First, link the package globally using npm:
-
-```bash
-# From the project directory
-npm link
-```
-
-Then add it to Claude Code:
+After installing the npm package globally, add it to Claude Code:
 
 ```bash
-claude mcp add python-debug --scope user -- npx -y python-debug-mcp-server
+claude mcp add python-debug --scope user -- python-debug-mcp-server
 ```
 
 This method automatically handles the configuration and makes the server available to Claude Code.
@@ -147,10 +156,14 @@ Add this server to your Claude Code MCP configuration to enable the debugging to
 
 #### Session Management
 
-**`start_debug_session`** - Start a new Python debugging session
+**`start_debug_session`** - Start a new Python debugging session (MCP manages the process)
 - `script_path` (required) - Path to Python script to debug
 - `args` (optional) - Command line arguments for the script
 - `cwd` (optional) - Working directory for the script
+
+**`attach_to_debugpy`** - Attach to existing debugpy session (user controls the process)
+- `script_path` (required) - Path to Python script being debugged
+- `port` (optional) - Port where debugpy is listening (default: 5678)
 
 **`stop_debug_session`** - Stop an active debugging session
 - `session_id` (required) - ID of the debug session to stop
@@ -203,6 +216,75 @@ Add this server to your Claude Code MCP configuration to enable the debugging to
 #### System Tools
 
 **`check_python_setup`** - Check if Python and debugpy are properly installed
+
+## User-Controlled Debugging (Recommended)
+
+For maximum control and stability, you can run your Python application in your own terminal and attach the MCP debugger to it.
+
+### Quick Start
+
+1. **Start your Python app with debugpy:**
+   ```bash
+   python3 -m debugpy --listen localhost:5678 your_script.py
+   ```
+
+2. **Attach the MCP debugger:**
+   ```
+   Tool: attach_to_debugpy
+   Arguments: { "script_path": "your_script.py", "port": 5678 }
+   ```
+
+3. **Set breakpoints and debug normally**
+
+### Detailed Steps
+
+#### For Flask/Web Applications
+
+1. **Start Flask with debugpy (disable Flask debug mode):**
+   ```python
+   # In your app.py, ensure debug=False
+   if __name__ == '__main__':
+       app.run(debug=False, port=5001)  # Important: debug=False
+   ```
+
+   ```bash
+   python3 -m debugpy --listen localhost:5678 app.py
+   ```
+
+2. **Your app will start serving immediately** on port 5001 while debugpy listens on port 5678
+
+3. **Attach the debugger:**
+   ```
+   Tool: attach_to_debugpy 
+   Arguments: { "script_path": "app.py" }
+   ```
+
+4. **Set breakpoints on request handlers:**
+   ```
+   Tool: set_breakpoint
+   Arguments: { "session_id": "...", "file": "app.py", "line": 25 }
+   ```
+
+5. **Make HTTP requests** to trigger breakpoints and inspect variables
+
+#### Why User-Controlled?
+
+- ✅ **Full control** - You manage when to start/stop your application
+- ✅ **No conflicts** - Avoids Flask debug mode vs debugpy conflicts  
+- ✅ **Stability** - More reliable connection and debugging experience
+- ✅ **Real environment** - Debug in your actual runtime environment
+
+#### Flask Debug Mode Conflict
+
+⚠️ **Important:** Flask's debug mode (`debug=True`) conflicts with debugpy. Always use `debug=False` when debugging with this MCP server.
+
+```python
+# ❌ This won't work well with debugpy
+app.run(debug=True)
+
+# ✅ This works perfectly with debugpy  
+app.run(debug=False)
+```
 
 ## Example Debugging Workflow
 
@@ -323,22 +405,61 @@ Terminal (Rich Logs)          Claude Code (Debug Panel)
 
 ### Common Issues
 
+#### Setup Issues
+
 **"debugpy is not installed"**
 ```bash
 pip install debugpy
 ```
 
 **"Python not found"**
-- Ensure Python is installed and in your PATH
-- Try `python --version` to verify
+- Ensure Python 3.8+ is installed and in your PATH
+- Try `python3 --version` to verify
+- On macOS/Linux, use `python3` not `python`
 
-**"Connection timeout"**  
+#### Connection Issues
+
+**"Failed to attach to debugpy session"**
+- Ensure your Python app is running with debugpy:
+  ```bash
+  python3 -m debugpy --listen localhost:5678 your_script.py
+  ```
+- Verify the port number matches (default: 5678)
 - Check if another process is using the debug port
-- Ensure the Python script path is correct
+
+**"DAP connection validation failed"**
+- Your Python process may have exited
+- Restart your Python app with debugpy
+- Check terminal for Python error messages
+
+**"Server disconnected unexpectedly"**
+- Usually indicates Flask debug mode conflict
+- Ensure `app.run(debug=False)` in your Flask app
+- Restart both Flask app and debug session
+
+#### Flask-Specific Issues
+
+**Breakpoints not hitting in Flask**
+- Disable Flask debug mode: `app.run(debug=False)`  
+- Flask's debugger conflicts with debugpy
+- Restart Flask with debugpy after changing debug mode
+
+**"Werkzeug Debugger" appears instead of breakpoint**
+- Flask debug mode is enabled
+- Change `app.run(debug=True)` to `app.run(debug=False)`
+- Flask's HTML debugger catches exceptions before debugpy
+
+#### Session Issues
 
 **"Session not found"**
 - Check the session ID is correct
 - List active sessions with `list_debug_sessions`
+- Session may have terminated if Python process ended
+
+**Curl requests hanging indefinitely**
+- This is normal when breakpoint is hit
+- Use debugger tools to continue execution
+- Press Ctrl+C to cancel hanging requests
 
 ### Debug Server Logs
 

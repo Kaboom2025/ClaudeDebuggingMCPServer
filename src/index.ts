@@ -415,6 +415,9 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           throw new McpError(ErrorCode.InvalidParams, validation.error!);
         }
 
+        // Check for Flask debug mode conflicts
+        const flaskDebugCheck = await detectFlaskDebugMode(script_path);
+        
         // Create session for attachment
         const session = sessionManager.createSession(resolve(script_path));
         // Override port for attachment
@@ -477,7 +480,22 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
               port,
               step: 'DAP_ATTACH'
             });
-            throw new Error(`DAP attachment failed: ${dapError}`);
+            
+            // Provide helpful error messages based on common issues
+            const errorMessage = dapError?.toString() || '';
+            let userFriendlyMessage = `DAP attachment failed: ${dapError}`;
+            
+            if (errorMessage.includes('ECONNREFUSED') || errorMessage.includes('Connection timeout')) {
+              userFriendlyMessage = `Failed to connect to debugpy on port ${port}. ` +
+                `Ensure your Python app is running with: python3 -m debugpy --listen localhost:${port} your_script.py`;
+            } else if (errorMessage.includes('Server') && errorMessage.includes('disconnected unexpectedly')) {
+              userFriendlyMessage = `Debugpy server disconnected unexpectedly. This often indicates:\n` +
+                `• Flask debug mode conflict (use app.run(debug=False))\n` +
+                `• Python process crashed\n` +
+                `• Check your terminal for Python error messages`;
+            }
+            
+            throw new Error(userFriendlyMessage);
           }
 
           sessionManager.updateSessionState(session.id, 'running');
@@ -487,17 +505,24 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
             state: 'running'
           });
 
+          let successMessage = `✅ Successfully attached to debugpy session!\n\n` +
+                              `Session ID: ${session.id}\n` +
+                              `Script: ${session.scriptPath}\n` +
+                              `Port: ${session.port}\n` +
+                              `State: ${session.state}\n\n` +
+                              `🐛 Attached to your running Python process. ` +
+                              `You can now set breakpoints and control execution.`;
+          
+          // Add Flask debug mode warning if detected
+          if (flaskDebugCheck.hasFlaskDebug && flaskDebugCheck.warning) {
+            successMessage += `\n\n${flaskDebugCheck.warning}`;
+          }
+
           return {
             content: [
               {
                 type: 'text',
-                text: `✅ Successfully attached to debugpy session!\n\n` +
-                      `Session ID: ${session.id}\n` +
-                      `Script: ${session.scriptPath}\n` +
-                      `Port: ${session.port}\n` +
-                      `State: ${session.state}\n\n` +
-                      `🐛 Attached to your running Python process. ` +
-                      `You can now set breakpoints and control execution.`,
+                text: successMessage,
               },
             ],
           };
@@ -656,9 +681,25 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
             sessionState: session.state
           });
           
+          // Provide helpful error messages based on common breakpoint issues
+          const errorMessage = error?.toString() || '';
+          let userFriendlyMessage = `Failed to set breakpoint at ${file}:${line}: ${error}`;
+          
+          if (errorMessage.includes('Server') && errorMessage.includes('disconnected unexpectedly')) {
+            userFriendlyMessage = `Debugpy connection lost while setting breakpoint. This often indicates:\n` +
+              `• Flask debug mode conflict - ensure app.run(debug=False)\n` +
+              `• Python process crashed or exited\n` +
+              `• Try restarting your Python app with debugpy and reattaching`;
+          } else if (errorMessage.includes('DAP connection validation failed')) {
+            userFriendlyMessage = `DAP connection invalid. Please:\n` +
+              `• Check if your Python process is still running\n` +
+              `• Restart debug session if needed\n` +
+              `• Ensure debugpy is listening on the correct port`;
+          }
+          
           throw new McpError(
             ErrorCode.InternalError, 
-            `Failed to set breakpoint at ${file}:${line}: ${error}`
+            userFriendlyMessage
           );
         }
       }
@@ -1324,6 +1365,37 @@ async function initializeThreadContext(session: any, dapClient: any): Promise<vo
   } catch (error) {
     // Thread initialization is not critical for basic functionality
     logger.system(session.id, `Thread context initialization failed: ${error}`);
+  }
+}
+
+async function detectFlaskDebugMode(scriptPath: string): Promise<{ hasFlaskDebug: boolean; warning?: string }> {
+  try {
+    // Read the Python file to check for Flask debug mode
+    const fs = await import('fs/promises');
+    const content = await fs.readFile(scriptPath, 'utf-8');
+    
+    // Look for common Flask debug mode patterns
+    const debugModePatterns = [
+      /app\.run\(\s*debug\s*=\s*True/i,
+      /app\.run\([^)]*debug\s*=\s*True/i,
+      /\.run\(\s*debug\s*=\s*True/i
+    ];
+    
+    const hasFlaskDebug = debugModePatterns.some(pattern => pattern.test(content));
+    
+    if (hasFlaskDebug) {
+      return {
+        hasFlaskDebug: true,
+        warning: `⚠️ Flask debug mode detected in ${scriptPath}. ` +
+          `Flask's debugger conflicts with debugpy. ` +
+          `Change app.run(debug=True) to app.run(debug=False) for proper debugging.`
+      };
+    }
+    
+    return { hasFlaskDebug: false };
+  } catch (error) {
+    // If we can't read the file, just proceed without validation
+    return { hasFlaskDebug: false };
   }
 }
 

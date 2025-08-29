@@ -1,0 +1,35 @@
+# Source TypeScript files (built JS is in build/)
+src/
+*.ts
+!*.d.ts
+
+# Development files  
+tsconfig.json
+.vscode/
+.DS_Store
+
+# Node modules and locks (will be installed by users)
+node_modules/
+package-lock.json
+npm-debug.log*
+
+# Git files
+.git/
+.gitignore
+
+# Example test outputs (keep the examples themselves)
+examples/**/*.log
+examples/**/__pycache__/
+examples/**/.pytest_cache/
+
+# Documentation build artifacts
+docs/**/*.tmp
+
+# IDE files
+*.swp
+*.swo
+*~
+
+# OS files
+Thumbs.db
+.DS_Store
